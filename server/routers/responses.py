@@ -471,17 +471,37 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
 
         def flush_calls() -> None:
             if pending_calls:
-                msg: dict = {
-                    'role': 'assistant',
-                    'content': None,
-                    'tool_calls': list(pending_calls),
-                }
+                # Responses represents one assistant turn as separate reasoning,
+                # message and call items. Chat must preserve that single turn:
+                # splitting its text and calls creates a synthetic assistant
+                # message and leaves the real reasoning off the tool-call turn.
+                reuse_previous = bool(
+                    messages
+                    and messages[-1].get('role') == 'assistant'
+                    and not messages[-1].get('tool_calls')
+                )
+                if reuse_previous:
+                    msg = messages[-1]
+                    msg['tool_calls'] = list(pending_calls)
+                else:
+                    msg = {
+                        'role': 'assistant',
+                        'content': None,
+                        'tool_calls': list(pending_calls),
+                    }
                 # 工具调用回合也可能带推理（模型先思考再调工具），一并保留，
                 # 否则这类多轮同样会因缺痕迹被腾讯拒。
                 pending = take_reasoning()
                 if pending is not None:
+                    existing = msg.get('reasoning') or msg.get('reasoning_content')
+                    if isinstance(existing, str) and existing.strip():
+                        if not pending.strip():
+                            pending = existing
+                        elif existing != pending:
+                            pending = existing + '\n' + pending
                     attach_reasoning(msg, pending)
-                messages.append(msg)
+                if not reuse_previous:
+                    messages.append(msg)
                 pending_calls.clear()
 
         for item in raw_input:
@@ -1367,11 +1387,13 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     if resp.status_code >= 400:
         raw = b''
         try:
-            async with resp:
-                raw = await resp.aread()
+            # send(..., stream=True) returns an HTTPX Response, which does not
+            # implement the async context-manager protocol. Read it directly.
+            raw = await resp.aread()
         except Exception:  # noqa: BLE001
             raw = b''
         finally:
+            await resp.aclose()
             await client.aclose()
         text = raw.decode('utf-8', errors='replace')[:500]
         parsed = None
