@@ -56,6 +56,10 @@ router = APIRouter(tags=['responses'])
 MAX_OUTPUT_ITEMS = 256
 
 
+class ToolSearchArgumentsError(ValueError):
+    """A client tool search must contain complete JSON object arguments."""
+
+
 class CustomToolArgumentsError(ValueError):
     """Custom/freeform tool output cannot be executed through a function wrapper."""
 
@@ -78,14 +82,39 @@ def _sanitize_tool_name(name: str) -> str:
 class _ToolBridge:
     """Flatten namespace children for Chat, then restore Responses names/types."""
 
-    def __init__(self, tools: object):
+    def __init__(self, tools: object, inputs: object = None):
         self.chat_tools: list[dict] = []
         self.custom_names: set[str] = set()
         self._forward: dict[str, str] = {}
         self._reverse: dict[str, tuple[str, str]] = {}
         self._taken: set[str] = set()
+        self.search_names: set[str] = set()
+        self.search_name = ''
+        self._seen: set[tuple[str, ...]] = set()
+        self._namespaces: dict[str, str] = {}
+        history = inputs if isinstance(inputs, list) else []
+        declarations = [t for t in tools or [] if isinstance(t, dict) and t.get('type') == 'tool_search'] if isinstance(tools, list) else []
+        if any(t.get('execution', 'client') != 'client' for t in declarations):
+            raise ToolSearchArgumentsError('This gateway supports client-executed tool search only.')
+        history_search = any(isinstance(i, dict) and i.get('type') in ('tool_search_call', 'tool_search_output') for i in history)
+        self.discovery = bool(declarations or history_search)
         if isinstance(tools, list):
             self._walk(tools, ())
+        for item in history:
+            if isinstance(item, dict) and item.get('type') in ('tool_search_output', 'additional_tools'):
+                loaded = item.get('tools')
+                if isinstance(loaded, list):
+                    self._walk(loaded, (), loaded=True)
+        if self.discovery:
+            self.search_name = self._unique('tool_search', 'codex_tool_search')
+            self.search_names.add(self.search_name)
+            spec = declarations[0] if declarations else {}
+            self.chat_tools.append({'type': 'function', 'function': {
+                'name': self.search_name,
+                'description': spec.get('description') or 'Search for additional tools to load for the next model call. The client executes this search.',
+                'parameters': spec.get('parameters') or {'type': 'object', 'properties': {
+                    'query': {'type': 'string'}, 'limit': {'type': 'number'}}, 'required': ['query']},
+            }})
 
     def _unique(self, preferred: str, fallback: str) -> str:
         base = _sanitize_tool_name(preferred) if preferred else _sanitize_tool_name(fallback)
@@ -97,19 +126,27 @@ class _ToolBridge:
         self._taken.add(name)
         return name
 
-    def _walk(self, tools: list, path: tuple[str, ...]) -> None:
+    def _walk(self, tools: list, path: tuple[str, ...], *, loaded: bool = False) -> None:
         for tool in tools:
             if not isinstance(tool, dict):
                 continue
             kind = tool.get('type')
+            if kind == 'tool_search':
+                continue
+            if self.discovery and tool.get('defer_loading') and not loaded:
+                continue
             name = _tool_name(tool)
             if kind == 'namespace':
                 children = tool.get('tools')
                 if isinstance(children, list) and name:
-                    self._walk(children, path + (name,))
+                    self._walk(children, path + (name,), loaded=loaded)
                 continue
             if not name:
                 continue
+            identity = path + (name,)
+            if identity in self._seen:
+                continue
+            self._seen.add(identity)
             preferred = name if name not in self._taken else '__'.join(path + (name,))
             chat_name = self._unique(preferred, '__'.join(path + (name,)))
             self._forward.setdefault(name, chat_name)
@@ -119,6 +156,8 @@ class _ToolBridge:
                 self._forward['__'.join(path + (name,))] = chat_name
             restored_kind = 'custom' if kind == 'custom' else 'function'
             self._reverse[chat_name] = (name, restored_kind)
+            if path:
+                self._namespaces[chat_name] = '.'.join(path)
             spec = {
                 'type': 'function',
                 'function': {
@@ -157,13 +196,29 @@ class _ToolBridge:
                     )
             self.chat_tools.append(spec)
 
-    def outbound_name(self, name: object) -> str:
+    def outbound_name(self, name: object, namespace: object = None) -> str:
         value = name if isinstance(name, str) else ''
+        if isinstance(namespace, str) and namespace:
+            return self._forward.get(namespace + '.' + value, value)
         return self._forward.get(value, value)
 
     def restore(self, name: object) -> tuple[str, str]:
         value = name if isinstance(name, str) else ''
         return self._reverse.get(value, (value, 'custom' if value in self.custom_names else 'function'))
+
+    def restore_namespace(self, name: str) -> str | None:
+        return self._namespaces.get(name) if self.discovery else None
+
+    def authorize_search(self, choice: object) -> None:
+        allowed = choice not in ('none',)
+        if isinstance(choice, dict):
+            allowed = choice.get('type') == 'tool_search' or (
+                choice.get('type') == 'allowed_tools' and any(
+                    isinstance(t, dict) and t.get('type') == 'tool_search'
+                    for t in choice.get('tools', [])
+                )
+            )
+        self.search_names = {self.search_name} if allowed and self.search_name else set()
 
 
 def _custom_tool_names(body: dict) -> set[str]:
@@ -411,6 +466,10 @@ def _convert_tool_choice(choice: object, bridge: _ToolBridge | None = None) -> o
     if isinstance(choice, str):
         return choice
     if isinstance(choice, dict):
+        if choice.get('type') == 'tool_search' and bridge and bridge.search_name:
+            return {'type': 'function', 'function': {'name': bridge.search_name}}
+        if choice.get('type') == 'allowed_tools' and isinstance(choice.get('tools'), list):
+            return choice.get('mode') if choice.get('mode') in ('auto', 'required', 'none') else 'auto'
         name = choice.get('name')
         if not name and isinstance(choice.get('function'), dict):
             name = choice['function'].get('name')
@@ -425,7 +484,8 @@ def _convert_tool_choice(choice: object, bridge: _ToolBridge | None = None) -> o
 def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
                     bridge: _ToolBridge | None = None) -> dict:
     """Responses 请求体 → Chat Completions 请求体。"""
-    bridge = bridge or _ToolBridge(body.get('tools'))
+    bridge = bridge or _ToolBridge(body.get('tools'), body.get('input'))
+    bridge.authorize_search(body.get('tool_choice'))
     custom_tool_names = custom_tool_names if custom_tool_names is not None else bridge.custom_names
     # `stream` 必须**转告上游**：上游靠这个字段决定是回 SSE 还是回一次性 JSON。
     # 漏掉它会得到一个"看起来很成功"的结果——网关按流式解析，上游却回了 JSON，
@@ -508,11 +568,22 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
             if not isinstance(item, dict):
                 continue
             kind = str(item.get('type') or '')
+            if kind == 'additional_tools':
+                continue
+            if kind == 'tool_search_call':
+                item = {**item, 'type': 'function_call', 'name': bridge.search_name,
+                        'arguments': _normalize_tool_arguments(item.get('arguments'))}
+                kind = 'function_call'
+            elif kind == 'tool_search_output':
+                item = {**item, 'type': 'function_call_output',
+                        'output': json.dumps({'tools': _loaded_tool_overview(item.get('tools', [])),
+                                              'status': item.get('status', 'completed')}, ensure_ascii=False)}
+                kind = 'function_call_output'
             if kind in ('function_call', 'custom_tool_call'):
                 if kind == 'custom_tool_call' and not isinstance(item.get('input'), str):
                     raise CustomToolArgumentsError(
                         'Custom tool history input must be a string.')
-                name = bridge.outbound_name(item.get('name'))
+                name = bridge.outbound_name(item.get('name'), item.get('namespace'))
                 raw_arguments = (
                     json.dumps({'input': item.get('input')}, ensure_ascii=False)
                     if kind == 'custom_tool_call'
@@ -644,6 +715,15 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
             out[key] = body[key]
 
     tools = _convert_tools(body.get('tools'), bridge)
+    raw_choice = body.get('tool_choice')
+    if isinstance(raw_choice, dict) and raw_choice.get('type') == 'allowed_tools':
+        allowed = {
+            converted['function']['name']
+            for t in raw_choice.get('tools', [])
+            if isinstance((converted := _convert_tool_choice(t, bridge)), dict)
+            and isinstance(converted.get('function'), dict)
+        }
+        tools = [t for t in tools or [] if t['function']['name'] in allowed]
     if tools:
         out['tools'] = tools
     choice = _convert_tool_choice(body.get('tool_choice'), bridge)
@@ -787,6 +867,41 @@ def _normalize_tool_arguments(raw: object) -> str:
     return json.dumps(raw, ensure_ascii=False)
 
 
+MAX_SEARCH_ARGUMENT_BYTES = 64 * 1024
+
+
+def _loaded_tool_overview(tools: object, namespace: str = '') -> list[dict]:
+    """Schemas are in the active catalog; history only needs loaded identities."""
+    out = []
+    for tool in tools if isinstance(tools, list) else []:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get('type') == 'namespace':
+            out.extend(_loaded_tool_overview(tool.get('tools'), str(tool.get('name') or '')))
+        elif name := _tool_name(tool):
+            out.append({'name': name, **({'namespace': namespace} if namespace else {})})
+    return out
+
+
+def _search_arguments(raw: object) -> dict:
+    if isinstance(raw, str):
+        if len(raw.encode()) > MAX_SEARCH_ARGUMENT_BYTES:
+            raise ToolSearchArgumentsError('Tool search arguments exceed the supported limit.')
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            raise ToolSearchArgumentsError('Tool search arguments are not complete JSON.') from exc
+    if not isinstance(raw, dict) or not isinstance(raw.get('query'), str) or not raw['query'].strip():
+        raise ToolSearchArgumentsError('Tool search requires a non-empty query string.')
+    return raw
+
+
+def _search_call_item(call_id: str, item_id: str, arguments: object) -> dict:
+    return {'type': 'tool_search_call', 'id': 'tsc_' + item_id.removeprefix('fc_'),
+            'call_id': call_id, 'execution': 'client', 'status': 'completed',
+            'arguments': _search_arguments(arguments)}
+
+
 def to_responses_object(
     data: dict,
     model: str,
@@ -818,7 +933,13 @@ def to_responses_object(
         raise CustomToolArgumentsError(
             'Custom tool response ended without a complete tool turn.')
     # A length-truncated custom call must never be exposed as executable output.
-    suppress_tools = bool(custom_calls) and finish == 'length'
+    search_calls = [c for c in calls if isinstance(c.get('function'), dict) and c['function'].get('name') in bridge.search_names]
+    if search_calls and finish not in ('stop', 'tool_calls', 'length'):
+        raise ToolSearchArgumentsError('Tool search response ended without a complete tool turn.')
+    for call in search_calls:
+        if finish != 'length':
+            _search_arguments(call['function'].get('arguments'))
+    suppress_tools = bool(custom_calls or search_calls) and finish == 'length'
     for call in custom_calls:
         _custom_input((call.get('function') or {}).get('arguments'))
     for call in ([] if suppress_tools else calls):
@@ -826,6 +947,10 @@ def to_responses_object(
             continue
         fn = call.get('function') or {}
         raw_name = str(fn.get('name') or '')
+        if raw_name in bridge.search_names:
+            output.append(_search_call_item(str(call.get('id') or f'call_{uuid.uuid4().hex[:12]}'),
+                                            'fc_' + uuid.uuid4().hex[:20], fn.get('arguments')))
+            continue
         name, restored_kind = bridge.restore(raw_name)
         is_custom = restored_kind == 'custom' or raw_name in custom_tool_names
         output.append(_custom_call_item(
@@ -839,6 +964,8 @@ def to_responses_object(
             name,
             _normalize_tool_arguments(fn.get('arguments')),
         ))
+        if namespace := bridge.restore_namespace(raw_name):
+            output[-1]['namespace'] = namespace
     text = message.get('content')
     if isinstance(text, str) and text:
         output.append(_message_item(text, 'msg_' + uuid.uuid4().hex[:20]))
@@ -880,6 +1007,7 @@ class _StreamTranslator:
         resp_id: str,
         custom_tool_names: set[str] | None = None,
         bridge: _ToolBridge | None = None,
+        defer_finish: bool = False,
     ) -> None:
         self.model = model
         self.resp_id = resp_id
@@ -903,10 +1031,14 @@ class _StreamTranslator:
 
         self.saw_content = False
         self.finish_reason: str | None = None
+        self.defer_finish = defer_finish
+        self.pending_finish: str | None = None
         self.usage: dict = {}
         self.custom_tool_names = custom_tool_names or set()
         self.bridge = bridge or _ToolBridge([])
         self.failed = False
+        self.buffer_tool_events = bool(self.custom_tool_names or self.bridge.search_names)
+        self.tool_error: ToolSearchArgumentsError | None = None
 
     # ── 事件构造 ──
     def _created(self) -> list[bytes]:
@@ -1022,7 +1154,7 @@ class _StreamTranslator:
         self.tool_order.append(seq)
         # A custom tool's name may arrive in several upstream fragments.
         # Buffer tool events until the final name/arguments can be validated.
-        if self.custom_tool_names:
+        if self.buffer_tool_events:
             return []
         return [_event('response.output_item.added', {
             'type': 'response.output_item.added',
@@ -1055,14 +1187,26 @@ class _StreamTranslator:
             # 整条流打断。`custom_inputs` 的键恰好就是 custom 的判据
             # （名字在 custom_names 里的 seq），所以两处都用它。
             restored_name, _kind = self.bridge.restore(state['name'])
+            if state['name'] in self.bridge.search_names:
+                item = _search_call_item(state['call_id'], state['id'], state['args'])
+                self.items.append(item)
+                out.extend([
+                    _event('response.output_item.added', {'type': 'response.output_item.added',
+                        'output_index': state['index'], 'item': {**item, 'arguments': {}, 'status': 'in_progress'}}),
+                    _event('response.output_item.done', {'type': 'response.output_item.done',
+                        'output_index': state['index'], 'item': item}),
+                ])
+                continue
             custom = seq in custom_inputs
             value = custom_inputs[seq] if custom else state['args']
             field = 'input' if custom else 'arguments'
             family = 'custom_tool_call_input' if custom else 'function_call_arguments'
             item = (_custom_call_item if custom else _function_call_item)(
                 state['call_id'], state['id'], restored_name, value)
+            if namespace := self.bridge.restore_namespace(state['name']):
+                item['namespace'] = namespace
             self.items.append(item)
-            if self.custom_tool_names:
+            if self.buffer_tool_events:
                 out.append(_event('response.output_item.added', {
                     'type': 'response.output_item.added',
                     'output_index': state['index'],
@@ -1103,6 +1247,10 @@ class _StreamTranslator:
         usage = obj.get('usage')
         if isinstance(usage, dict):
             self.usage.update(usage)
+        if self.pending_finish is not None:
+            # Chat stream_options.include_usage sends a separate final usage
+            # chunk after finish_reason. Keep it, but ignore any later content.
+            return out
 
         choices = obj.get('choices')
         if not isinstance(choices, list) or not choices:
@@ -1161,7 +1309,7 @@ class _StreamTranslator:
                     str(name or ''),
                 )
             state = self.tools[seq]
-            if self.custom_tool_names:
+            if self.buffer_tool_events:
                 # The first fragment is already stored by _open_tool. Later
                 # fragments may continue a split name; repeated full names
                 # are ignored so they do not become "BashBash".
@@ -1174,8 +1322,12 @@ class _StreamTranslator:
             # 分片参数原样透传，拼接交给客户端
             args = fn.get('arguments')
             if isinstance(args, str) and args:
-                state['args'] += args
-                if not self.custom_tool_names:
+                if not self.tool_error:
+                    state['args'] += args
+                if self.bridge.search_names and len(state['args'].encode()) > MAX_SSE_BUFFER:
+                    self.tool_error = ToolSearchArgumentsError('Buffered tool arguments exceed the supported limit.')
+                    state['args'] = ''
+                if not self.buffer_tool_events:
                     out.append(_event('response.function_call_arguments.delta', {
                         'type': 'response.function_call_arguments.delta',
                         'output_index': state['index'],
@@ -1185,13 +1337,17 @@ class _StreamTranslator:
 
         finish = choice.get('finish_reason')
         if finish:
-            out += self.finish(str(finish))
+            if self.defer_finish:
+                self.pending_finish = str(finish)
+            else:
+                out += self.finish(str(finish))
         return out
 
     def finish(self, finish_reason: str | None = None, *, force: bool = False) -> list[bytes]:
         """收尾：关掉打开的输出项并下发终止事件（幂等）。"""
         if self.finished:
             return []
+        finish_reason = finish_reason or self.pending_finish
         self.finished = True
         self.finish_reason = finish_reason
         out: list[bytes] = []
@@ -1206,6 +1362,8 @@ class _StreamTranslator:
         if force and finish_reason is None and self.tools:
             finish_reason = 'tool_calls'
         try:
+            if self.tool_error:
+                raise self.tool_error
             has_custom = any(
                 state['name'] in self.custom_tool_names
                 for state in self.tools.values()
@@ -1218,7 +1376,12 @@ class _StreamTranslator:
             ):
                 raise CustomToolArgumentsError(
                     'Upstream tool call has no complete tool name.')
-            if finish_reason == 'length' and has_custom:
+            has_search = any(state['name'] in self.bridge.search_names for state in self.tools.values())
+            if has_search and finish_reason not in ('stop', 'tool_calls', 'length'):
+                raise ToolSearchArgumentsError('Tool search response ended without a complete tool turn.')
+            if finish_reason == 'length' and has_search:
+                pass  # Never execute a truncated discovery call.
+            elif finish_reason == 'length' and has_custom:
                 # A complete wrapper at a length stop is still incomplete and
                 # must not be exposed as an executable custom call.
                 for state in self.tools.values():
@@ -1226,7 +1389,7 @@ class _StreamTranslator:
                         _custom_input(state['args'])
             else:
                 out += self._close_tools()
-        except CustomToolArgumentsError as exc:
+        except (CustomToolArgumentsError, ToolSearchArgumentsError) as exc:
             self.failed = True
             out.append(_event('response.failed', {
                 'type': 'response.failed',
@@ -1238,7 +1401,7 @@ class _StreamTranslator:
                     'model': self.model,
                     'output': self.items,
                     'error': {
-                        'code': 'invalid_custom_tool_arguments',
+                        'code': 'invalid_tool_search_arguments' if isinstance(exc, ToolSearchArgumentsError) else 'invalid_custom_tool_arguments',
                         'message': str(exc),
                     },
                     'usage': _usage_object(self.usage),
@@ -1294,10 +1457,9 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
 
     ua = request.headers.get('user-agent')
     stream = bool(body.get('stream'))
-    bridge = _ToolBridge(body.get('tools'))
-    custom_tool_names = bridge.custom_names
-
     try:
+        bridge = _ToolBridge(body.get('tools'), body.get('input'))
+        custom_tool_names = bridge.custom_names
         payload = to_chat_request(body, custom_tool_names, bridge)
     except Exception as exc:  # noqa: BLE001
         gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False)
@@ -1361,9 +1523,11 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 # 客户端按名字回传下一轮时会匹配不上。
                 to_responses_object(data, model, resp_id, custom_tool_names, bridge)
             )
-        except CustomToolArgumentsError as exc:
+        except (CustomToolArgumentsError, ToolSearchArgumentsError) as exc:
             return _failed(
-                str(exc), 502, 'api_error', 'invalid_custom_tool_arguments')
+                str(exc), 502, 'api_error',
+                'invalid_tool_search_arguments' if isinstance(exc, ToolSearchArgumentsError)
+                else 'invalid_custom_tool_arguments')
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
             gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False)
@@ -1410,7 +1574,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     async def gen():
         pending = ''
         translator = _StreamTranslator(
-            model, resp_id, custom_tool_names=custom_tool_names, bridge=bridge)
+            model, resp_id, custom_tool_names=custom_tool_names, bridge=bridge,
+            defer_finish=True)
         error_text: str | None = None
         first_token_ms: int | None = None
 
