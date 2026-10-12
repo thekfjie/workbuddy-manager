@@ -808,12 +808,19 @@ def _usage_object(usage: dict) -> dict:
     }
 
 
-def _message_item(text: str, item_id: str) -> dict:
+def _message_phase(finish: str | None, has_tools: bool) -> str:
+    # Chat has no native assistant phase. Tool preambles belong to the working
+    # timeline; only a complete, tool-free answer closes the assistant turn.
+    return 'final_answer' if finish == 'stop' and not has_tools else 'commentary'
+
+
+def _message_item(text: str, item_id: str, phase: str = 'final_answer') -> dict:
     return {
         'type': 'message',
         'id': item_id,
         'status': 'completed',
         'role': 'assistant',
+        'phase': phase,
         'content': [{'type': 'output_text', 'text': text, 'annotations': []}],
     }
 
@@ -924,6 +931,10 @@ def to_responses_object(
     if isinstance(reasoning, str) and reasoning:
         output.append(_reasoning_item(reasoning, 'rs_' + uuid.uuid4().hex[:20]))
     calls = [call for call in message.get('tool_calls') or [] if isinstance(call, dict)]
+    text = message.get('content')
+    if isinstance(text, str) and text:
+        output.append(_message_item(text, 'msg_' + uuid.uuid4().hex[:20],
+                                    _message_phase(finish, bool(calls))))
     custom_calls = [
         call for call in calls
         if isinstance(call.get('function'), dict)
@@ -966,10 +977,6 @@ def to_responses_object(
         ))
         if namespace := bridge.restore_namespace(raw_name):
             output[-1]['namespace'] = namespace
-    text = message.get('content')
-    if isinstance(text, str) and text:
-        output.append(_message_item(text, 'msg_' + uuid.uuid4().hex[:20]))
-
     status, incomplete = ('completed', None) if finish != 'length' else (
         'incomplete', {'reason': 'max_output_tokens'})
     return {
@@ -1016,6 +1023,7 @@ class _StreamTranslator:
         self.finished = False
         self.next_index = 0
         self.items: list[dict] = []
+        self.item_indices: dict[str, int] = {}
 
         self.reason_index: int | None = None
         self.reason_id = ''
@@ -1041,6 +1049,13 @@ class _StreamTranslator:
         self.tool_error: ToolSearchArgumentsError | None = None
 
     # ── 事件构造 ──
+    def _record_item(self, index: int, item: dict) -> None:
+        self.item_indices[item['id']] = index
+        self.items.append(item)
+        # Buffered tool calls may complete after later text. The terminal
+        # output array must preserve their original output_index order.
+        self.items.sort(key=lambda value: self.item_indices[value['id']])
+
     def _created(self) -> list[bytes]:
         self.started = True
         return [_event('response.created', {
@@ -1056,6 +1071,7 @@ class _StreamTranslator:
         })]
 
     def _open_reason(self) -> list[bytes]:
+        self.reason_buf = ''
         self.reason_index = self.next_index
         self.next_index += 1
         self.reason_id = 'rs_' + uuid.uuid4().hex[:20]
@@ -1078,7 +1094,7 @@ class _StreamTranslator:
         # 客户端在 `output_item.done` 上取这个字段（issue #36：此前从没发过，
         # 于是客户端拿不到凭据，下一轮不带推理痕迹，上游报 11155）。
         item = _reasoning_item(self.reason_buf, self.reason_id)
-        self.items.append(item)
+        self._record_item(index, item)
         return [_event('response.output_item.done', {
             'type': 'response.output_item.done',
             'output_index': index,
@@ -1086,6 +1102,7 @@ class _StreamTranslator:
         })]
 
     def _open_text(self) -> list[bytes]:
+        self.text_buf = ''
         self.text_index = self.next_index
         self.next_index += 1
         self.text_id = 'msg_' + uuid.uuid4().hex[:20]
@@ -1099,6 +1116,7 @@ class _StreamTranslator:
                     'id': self.text_id,
                     'status': 'in_progress',
                     'role': 'assistant',
+                    'phase': 'commentary',
                     'content': [],
                 },
             }),
@@ -1111,13 +1129,13 @@ class _StreamTranslator:
             }),
         ]
 
-    def _close_text(self) -> list[bytes]:
+    def _close_text(self, phase: str = 'commentary') -> list[bytes]:
         if self.text_index is None:
             return []
         index, self.text_index = self.text_index, None
         part = {'type': 'output_text', 'text': self.text_buf, 'annotations': []}
-        item = _message_item(self.text_buf, self.text_id)
-        self.items.append(item)
+        item = _message_item(self.text_buf, self.text_id, phase)
+        self._record_item(index, item)
         return [
             _event('response.output_text.done', {
                 'type': 'response.output_text.done',
@@ -1189,7 +1207,7 @@ class _StreamTranslator:
             restored_name, _kind = self.bridge.restore(state['name'])
             if state['name'] in self.bridge.search_names:
                 item = _search_call_item(state['call_id'], state['id'], state['args'])
-                self.items.append(item)
+                self._record_item(state['index'], item)
                 out.extend([
                     _event('response.output_item.added', {'type': 'response.output_item.added',
                         'output_index': state['index'], 'item': {**item, 'arguments': {}, 'status': 'in_progress'}}),
@@ -1205,7 +1223,7 @@ class _StreamTranslator:
                 state['call_id'], state['id'], restored_name, value)
             if namespace := self.bridge.restore_namespace(state['name']):
                 item['namespace'] = namespace
-            self.items.append(item)
+            self._record_item(state['index'], item)
             if self.buffer_tool_events:
                 out.append(_event('response.output_item.added', {
                     'type': 'response.output_item.added',
@@ -1354,7 +1372,7 @@ class _StreamTranslator:
         if not self.started:
             out += self._created()
 
-        out += self._close_text()
+        out += self._close_text(_message_phase(finish_reason, bool(self.tools)))
         out += self._close_reason()
 
         # 上游出现过工具调用却没给 finish_reason 时，仍按工具收尾更贴近实际：
